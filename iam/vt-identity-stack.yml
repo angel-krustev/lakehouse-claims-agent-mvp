@@ -1,0 +1,383 @@
+﻿# Copyright 2026 Angel Krustev / VerticalTurn Inc.
+# SPDX-License-Identifier: Apache-2.0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  lakehouse-claims-agent-mvp identity stack: the three IAM roles the PEP depends on, in one stack.
+  (1) OIDC bootstrap role - Plane A, assumed with the user's IDP JWT, only calls CreateTokenWithIAM.
+  (2) Enhanced (carrier) role - Plane B target, scoped to Lake Formation, Athena, Redshift
+      Serverless and S3 Access Grants. Nothing else.
+  (3) PEP base role - ambient identity (ECS task role / local credentials) that signs the
+      AssumeRole call on the carrier role. It has no data permissions.
+  Creates NEW roles; the pre-existing idp-stack roles are neither referenced nor modified.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: vt
+    AllowedPattern: "^[A-Za-z][A-Za-z0-9+=,.@_-]{0,24}$"
+    Description: Prefix for role names (<prefix>-OIDCRole, <prefix>-IdEnhancedRole, <prefix>-PepServiceRole).
+
+  OidcProviderArn:
+    Type: String
+    Default: arn:aws:iam::991536801739:oidc-provider/login.microsoftonline.com/55467fb1-8933-49d8-9164-74cb390e0433/v2.0
+    AllowedPattern: '^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/[^\s"\\]+$'
+    Description: >
+      Existing IAM OIDC provider for the IDP (for example
+      arn:aws:iam::<acct>:oidc-provider/login.microsoftonline.com/<tenant>/v2.0). Referenced, not created.
+
+  OidcAudiences:
+    Type: String
+    Default: 01c6a4ba-0c04-4757-9692-5477e275f583,17a01289-c3e9-4b5e-9eab-0d2cac811113
+    AllowedPattern: '^[^\s",\\]+(,[^\s",\\]+)*$'
+    ConstraintDescription: One or more audiences separated by commas, with no spaces, quotes or line breaks.
+    Description: >
+      Token audiences (Entra client ids) accepted by the OIDC role, comma-separated on one line,
+      for example 11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222.
+
+  AthenaWorkGroup:
+    Type: String
+    Default: idc-wg
+    Description: Athena workgroup the carrier role may use. Must match the PEP ATHENA_WORKGROUP setting.
+
+  AthenaResultsBucketName:
+    Type: String
+    Default: aws-athena-query-results-991536801739-us-east-1-d4hh5d2j
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Bucket name only (no s3:// prefix, no path), or empty.
+    Description: >
+      Optional S3 bucket name for Athena query results when the caller (not the workgroup) writes
+      them. Leave empty if the workgroup enforces its own output location.
+
+  RedshiftWorkgroupName:
+    Type: String
+    Default: "*"
+    Description: Redshift Serverless workgroup name for the Data API ("*" = any workgroup in this account/region).
+
+  AllowOidcRoleToAssumeCarrier:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >
+      Legacy single-call exchange() path only: let the OIDC role assume the carrier role
+      directly. The PEP (Plane A + Plane B) does not need this.
+
+  TrustEcsTasks:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Allow ecs-tasks.amazonaws.com to assume the PEP base role (Fargate task role).
+
+  LocalDevPrincipalArns:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional IAM user/role ARNs allowed to assume the PEP base role for local container
+      runs. Leave empty in deployed environments.
+
+  LocalDevRequireMfa:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Require MFA when LocalDevPrincipalArns assume the PEP base role.
+
+Conditions:
+  HasAthenaResultsBucket: !Not [!Equals [!Ref AthenaResultsBucketName, ""]]
+  OidcCanAssumeCarrier: !Equals [!Ref AllowOidcRoleToAssumeCarrier, "true"]
+  HasEcsTrust: !Equals [!Ref TrustEcsTasks, "true"]
+  HasLocalDevPrincipals: !Not [!Equals [!Join ["", !Ref LocalDevPrincipalArns], ""]]
+  LocalDevMfa: !Equals [!Ref LocalDevRequireMfa, "true"]
+
+Resources:
+  #####################################################################
+  # (1) OIDC bootstrap role  ->  OIDC_ROLE_ARN
+  #####################################################################
+  OidcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-OIDCRole"
+      Description: Plane A bootstrap. Assumed with the IDP JWT; only calls CreateTokenWithIAM.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument: !Sub
+        - |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowWebIdentityFromIdp",
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcProviderArn}"},
+                "Action": ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"],
+                "Condition": {"StringEquals": {"${OidcHost}:aud": ["${Audiences}"]}}
+              },
+              {
+                "Sid": "AllowSourceIdentityFromIdp",
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcProviderArn}"},
+                "Action": "sts:SetSourceIdentity",
+                "Condition": {"StringEquals": {"${OidcHost}:aud": ["${Audiences}"]}}
+              }
+            ]
+          }
+        - OidcHost: !Select [1, !Split ["oidc-provider/", !Ref OidcProviderArn]]
+          Audiences: !Join ['", "', !Split [",", !Ref OidcAudiences]]
+      Policies:
+        - PolicyName: create-token-with-iam
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ExchangeIdpTokenForIdentityContext
+                Effect: Allow
+                Action: sso-oauth:CreateTokenWithIAM
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: lakehouse-claims-agent-mvp
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Component
+          Value: oidc-bootstrap
+
+  # Separate resource so the OIDC role does not depend on the carrier role (and vice versa).
+  OidcAssumeCarrierPolicy:
+    Type: AWS::IAM::Policy
+    Condition: OidcCanAssumeCarrier
+    Properties:
+      PolicyName: assume-enhanced-role
+      Roles:
+        - !Ref OidcRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+              - sts:SetContext
+              - sts:SetSourceIdentity
+            Resource: !GetAtt EnhancedRole.Arn
+
+  #####################################################################
+  # (2) Enhanced (carrier) role  ->  TIP_ROLE_ARN
+  #####################################################################
+  EnhancedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-IdEnhancedRole"
+      Description: Plane B carrier role. Lake Formation, Athena, Redshift Serverless, S3 Access Grants.
+      # Chained from the PEP base role, so AWS caps it at 1 hour anyway; the PEP requests 900 s.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowPepAssumeWithIdentityContext
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt PepServiceRole.Arn
+            Action:
+              - sts:AssumeRole
+              - sts:SetContext
+              - sts:SetSourceIdentity
+          - !If
+            - OidcCanAssumeCarrier
+            - Sid: AllowOidcRoleLegacyExchange
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt OidcRole.Arn
+              Action:
+                - sts:AssumeRole
+                - sts:SetContext
+                - sts:SetSourceIdentity
+            - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: vt-data-plane
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # --- Lake Formation (no resource-level scoping; LF enforces the user's own grants) ---
+              - Sid: LakeFormationDataAccess
+                Effect: Allow
+                Action: lakeformation:GetDataAccess
+                Resource: "*"
+
+              # --- Athena ---
+              - Sid: AthenaWorkgroupQueries
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetQueryResultsStream
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+              - Sid: AthenaDiscovery
+                Effect: Allow
+                Action:
+                  - athena:ListDataCatalogs
+                  - athena:ListDatabases
+                  - athena:ListWorkGroups
+                Resource: "*"
+
+              # --- Glue Data Catalog, read only (needed by Athena and Redshift Spectrum) ---
+              - Sid: GlueCatalogRead
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*/*"
+
+              # --- Athena results bucket (only when the caller writes results) ---
+              - !If
+                - HasAthenaResultsBucket
+                - Sid: AthenaResultsBucket
+                  Effect: Allow
+                  Action:
+                    - s3:GetBucketLocation
+                    - s3:ListBucket
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:AbortMultipartUpload
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}"
+                    - !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}/*"
+                - !Ref AWS::NoValue
+
+              # --- S3 Access Grants (data-plane consumer actions only, no grant administration) ---
+              - Sid: S3AccessGrantsInstance
+                Effect: Allow
+                Action:
+                  - s3:GetAccessGrantsInstanceForPrefix
+                Resource: !Sub "arn:${AWS::Partition}:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default"
+              - Sid: S3AccessGrantsCaller
+                Effect: Allow
+                Action:
+                  - s3:GetDataAccess
+                  - s3:ListCallerAccessGrants
+                Resource: "*"
+
+              # --- Redshift Serverless via the Data API ---
+              - Sid: RedshiftDataExecute
+                Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:BatchExecuteStatement
+                Resource: !Sub "arn:${AWS::Partition}:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/${RedshiftWorkgroupName}"
+              # These actions do not support resource-level permissions; statements are
+              # still bound to the calling identity by the Data API.
+              - Sid: RedshiftDataStatementAccess
+                Effect: Allow
+                Action:
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:CancelStatement
+                  - redshift-data:ListStatements
+                  - redshift-data:ListDatabases
+                  - redshift-data:ListSchemas
+                  - redshift-data:ListTables
+                  - redshift-data:DescribeTable
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: lakehouse-claims-agent-mvp
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Component
+          Value: carrier
+
+  #####################################################################
+  # (3) PEP base role (Fargate task role / local credentials)
+  #####################################################################
+  PepServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${NamePrefix}-PepServiceRole"
+      Description: Base identity for the lakehouse-claims-agent-mvp PEP; may only assume the enhanced role.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - HasEcsTrust
+            - Sid: AllowEcsTasks
+              Effect: Allow
+              Principal:
+                Service: ecs-tasks.amazonaws.com
+              Action: sts:AssumeRole
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+            - !Ref AWS::NoValue
+          - !If
+            - HasLocalDevPrincipals
+            - !If
+              - LocalDevMfa
+              - Sid: AllowLocalDevWithMfa
+                Effect: Allow
+                Principal:
+                  AWS: !Ref LocalDevPrincipalArns
+                Action: sts:AssumeRole
+                Condition:
+                  Bool:
+                    aws:MultiFactorAuthPresent: "true"
+              - Sid: AllowLocalDev
+                Effect: Allow
+                Principal:
+                  AWS: !Ref LocalDevPrincipalArns
+                Action: sts:AssumeRole
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: lakehouse-claims-agent-mvp
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Component
+          Value: pep
+
+  # Separate resource: the carrier trust policy references this role, so a Policies block
+  # that references the carrier role here would create a circular dependency.
+  PepAssumeCarrierPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: pep-assume-enhanced-role
+      Roles:
+        - !Ref PepServiceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # SetContext carries the Identity Center assertion (ProvidedContexts); SetSourceIdentity
+          # stamps the agent role for CloudTrail. The PEP passes no session tags, so no TagSession.
+          - Sid: AssumeEnhancedRoleWithIdentityContext
+            Effect: Allow
+            Action:
+              - sts:AssumeRole
+              - sts:SetContext
+              - sts:SetSourceIdentity
+            Resource: !GetAtt EnhancedRole.Arn
+
+Outputs:
+  OidcRoleArn:
+    Description: Set as OIDC_ROLE_ARN.
+    Value: !GetAtt OidcRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-oidc-role-arn"
+
+  EnhancedRoleArn:
+    Description: Set as TIP_ROLE_ARN (carrier role).
+    Value: !GetAtt EnhancedRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-enhanced-role-arn"
+
+  PepServiceRoleArn:
+    Description: Use as the Fargate task role (taskRoleArn) or assume locally to obtain base credentials.
+    Value: !GetAtt PepServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-pep-service-role-arn"
