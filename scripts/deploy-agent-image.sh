@@ -14,7 +14,7 @@ set -euo pipefail
 REPOSITORY="lakehouse-claims-agent-mvp"
 TAG="v0.1.0"
 REGION="us-east-1"
-EXPECTED_ACCOUNT_ID="991536801739"
+EXPECTED_ACCOUNT_ID=""
 
 usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 

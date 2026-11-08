@@ -54,18 +54,18 @@ variable "aws_region" {
 
 variable "vpc_id" {
   type    = string
-  default = "vpc-9f4ad5e6"
+  default = "${VPC_ID}"
 }
 
 variable "internal_certificate_arn" {
   description = "ACM certificate for the ALB HTTPS listener."
   type        = string
-  default     = "arn:aws:acm:us-east-1:991536801739:certificate/44ca45ca-daa3-43cd-9a59-9b39dc3a4e2f"
+  default     = "${INTERNAL_CERTIFICATE_ARN}"
 }
 
 variable "pep_container_image" {
   type    = string
-  default = "991536801739.dkr.ecr.us-east-1.amazonaws.com/agentcore-tip-mcp-test:7979d40"
+  default = "${PEP_CONTAINER_IMAGE}"
 }
 
 variable "pep_cpu_architecture" {

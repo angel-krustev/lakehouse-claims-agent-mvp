@@ -15,19 +15,19 @@ Description: >
 Parameters:
   IdentityStackName:
     Type: String
-    Default: vt-identity
+    Default: ${IdentityStackName}
     Description: Name of the deployed iam/vt-identity-stack.yml stack (its exports supply the PEP task role and the OIDC and carrier roles).
   NetworkStackName:
     Type: String
-    Default: claims-copilot-network
+    Default: ${NetworkStackName}
     Description: Name of the deployed template-network.yaml stack (its exports supply the VPC, private subnets and security groups).
   InternalCertificateArn:
     Type: String
-    Default: arn:aws:acm:us-east-1:991536801739:certificate/44ca45ca-daa3-43cd-9a59-9b39dc3a4e2f
+    Default: ${InternalCertificateArn}
     Description: ACM certificate for the ALB HTTPS listener.
   PepContainerImage:
     Type: String
-    Default: 991536801739.dkr.ecr.us-east-1.amazonaws.com/agentcore-tip-mcp-test:7979d40
+    Default: ${PepContainerImage}
   PepCpuArchitecture:
     Type: String
     Default: ARM64
@@ -35,27 +35,27 @@ Parameters:
     Description: CPU architecture of the PEP image.
   EntraTenantId:
     Type: String
-    Default: 55467fb1-8933-49d8-9164-74cb390e0433
+    Default: ${EntraTenantId}
     AllowedPattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
     ConstraintDescription: Must be a GUID such as 11111111-2222-3333-4444-555555555555.
     Description: Entra ID tenant ID.
   EntraClientId:
     Type: String
-    Default: 01c6a4ba-0c04-4757-9692-5477e275f583
+    Default: ${EntraClientId}
     AllowedPattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
     ConstraintDescription: Must be a GUID such as 11111111-2222-3333-4444-555555555555.
     Description: Entra ID application (client) ID; the audience of the ID token.
   SsoApplicationArn:
     Type: String
-    Default: arn:aws:sso::991536801739:application/ssoins-7223713ff5164dc6/apl-72232579ee142ca0
+    Default: ${SsoApplicationArn}
     Description: IAM Identity Center application ARN used for trusted identity propagation (the PEP's SSO_CLIENT_ID).
   AthenaWorkGroup:
     Type: String
-    Default: idc-wg
+    Default: ${AthenaWorkGroup}
     Description: Must match AthenaWorkGroup in the identity stack.
   AthenaDatabaseName:
     Type: String
-    Default: insurance_analytics
+    Default: ${AthenaDatabaseName}
   DeployAgentRuntime:
     Type: String
     Default: "true"
@@ -65,14 +65,14 @@ Parameters:
       false to bring up only the PEP and ALB before the image exists.
   AgentRepositoryName:
     Type: String
-    Default: lakehouse-claims-agent-mvp
+    Default: ${AgentRepositoryName}
     Description: Existing ECR repository holding the agent image.
   AgentImageTag:
     Type: String
-    Default: v0.2.0
+    Default: ${AgentImageTag}
   ModelId:
     Type: String
-    Default: us.anthropic.claude-sonnet-4-6
+    Default: ${ModelId}
     Description: Bedrock model or inference profile ID the agent uses (Converse API with tool use).
   ModelTemperature:
     Type: Number
@@ -87,16 +87,16 @@ Parameters:
     Description: Optional nucleus sampling (0-1). Leave empty to omit; recent Claude models reject temperature and topP together.
   ModelMaxTokens:
     Type: Number
-    Default: 4096
+    Default: ${ModelMaxTokens}
     MinValue: 1
     Description: Maximum output tokens per model call.
   ServiceDiscoveryDomain:
     Type: String
-    Default: claims-copilot.internal
+    Default: ${ServiceDiscoveryDomain}
     Description: Private DNS domain in the VPC; Plane B resolves as plane-b.<domain>.
   PepDesiredCount:
     Type: Number
-    Default: 1
+    Default: ${PepDesiredCount}
     MinValue: 1
     Description: >
       Keep at 1. The PEP keeps sessions in memory: /sessions/init (through the ALB) and the agent's tool calls

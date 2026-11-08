@@ -19,7 +19,7 @@ Parameters:
 
   OidcProviderArn:
     Type: String
-    Default: arn:aws:iam::991536801739:oidc-provider/login.microsoftonline.com/55467fb1-8933-49d8-9164-74cb390e0433/v2.0
+    Default: ${OidcProviderArn}
     AllowedPattern: '^arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/[^\s"\\]+$'
     Description: >
       Existing IAM OIDC provider for the IDP (for example
@@ -27,7 +27,7 @@ Parameters:
 
   OidcAudiences:
     Type: String
-    Default: 01c6a4ba-0c04-4757-9692-5477e275f583,17a01289-c3e9-4b5e-9eab-0d2cac811113
+    Default: ${OidcAudiences}
     AllowedPattern: '^[^\s",\\]+(,[^\s",\\]+)*$'
     ConstraintDescription: One or more audiences separated by commas, with no spaces, quotes or line breaks.
     Description: >
@@ -41,7 +41,7 @@ Parameters:
 
   AthenaResultsBucketName:
     Type: String
-    Default: aws-athena-query-results-991536801739-us-east-1-d4hh5d2j
+    Default: ${AthenaResultsBucketName}
     AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
     ConstraintDescription: Bucket name only (no s3:// prefix, no path), or empty.
     Description: >

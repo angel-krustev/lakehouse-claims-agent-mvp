@@ -10,29 +10,29 @@ Description: >
 Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Default: vpc-9f4ad5e6
+    Default: ${VpcId}
   NatSubnetId:
     Type: AWS::EC2::Subnet::Id
-    Default: subnet-6295034e
+    Default: ${NatSubnetId}
     Description: Existing PUBLIC subnet (route to the internet gateway) that hosts the NAT gateway.
   PrivateSubnetCidrs:
     Type: CommaDelimitedList
-    Default: 172.31.96.0/20,172.31.112.0/20
+    Default: ${PrivateSubnetCidrs}
     Description: Two unused CIDR blocks inside the VPC for the private subnets (PEP, ALB and AgentCore Runtime).
   PrivateSubnetAzIds:
     Type: CommaDelimitedList
-    Default: use1-az2,use1-az4
+    Default: ${PrivateSubnetAzIds}
     Description: >
       AZ IDs (not names) for the two private subnets, in the same order as the CIDRs. In us-east-1 AgentCore Runtime
       supports only use1-az1, use1-az2 and use1-az4.
   VpnOrStreamlitCidr:
     Type: String
-    Default: 10.0.0.0/16
+    Default: ${VpnOrStreamlitCidr}
     AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
     Description: CIDR allowed to reach the internal ALB (Plane A). Only matches clients whose own address reaches the ALB (no address translation).
   VpnSecurityGroupId:
     Type: String
-    Default: sg-0573e07e894361788
+    Default: ${VpnSecurityGroupId}
     AllowedPattern: ^$|^sg-[0-9a-f]{8,17}$
     ConstraintDescription: Empty, or a security group ID such as sg-0123456789abcdef0.
     Description: >

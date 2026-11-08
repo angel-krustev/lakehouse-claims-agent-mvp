@@ -19,7 +19,7 @@ param(
     [string]$Repository = "lakehouse-claims-agent-mvp",
     [string]$Tag = "v0.1.0",
     [string]$Region = "us-east-1",
-    [string]$ExpectedAccountId = "991536801739"
+    [string]$ExpectedAccountId = ""
 )
 
 $ErrorActionPreference = "Stop"

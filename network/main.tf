@@ -45,13 +45,13 @@ variable "aws_region" {
 
 variable "vpc_id" {
   type    = string
-  default = "vpc-9f4ad5e6"
+  default = "${VPC_ID}"
 }
 
 variable "nat_subnet_id" {
   description = "Existing PUBLIC subnet (route to the internet gateway) that hosts the NAT gateway."
   type        = string
-  default     = "subnet-6295034e"
+  default     = "${NAT_SUBNET_ID}"
 }
 
 variable "private_subnet_cidrs" {
