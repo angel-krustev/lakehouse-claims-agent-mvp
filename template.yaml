@@ -1,0 +1,522 @@
+﻿# Copyright 2026 Angel Krustev / VerticalTurn Inc.
+# SPDX-License-Identifier: Apache-2.0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Secure Insurance Claims Copilot - app stack: Zero-Trust Broker (PEP) on ECS Fargate behind an internal ALB
+  (Plane A only), plus a Bedrock AgentCore Runtime agent. Clients call the runtime with their Entra ID JWT
+  (inbound JWT authorizer, no AWS keys). The runtime reaches PEP Plane B only through a Lambda proxy whose
+  verified execution role becomes the x-amzn-caller-arn the PEP sees.
+  Requires two other stacks: the identity stack iam/vt-identity-stack.yml (roles) and the core network stack
+  template-network.yaml (VPC subnets, NAT, security groups). Both are imported, never created here, so this
+  stack can fail, roll back or be deleted without touching the subnets and security groups that AgentCore
+  network interfaces keep for hours.
+  Push the agent image first (scripts/deploy-agent-image.ps1), then deploy with DeployAgentRuntime=true.
+
+Parameters:
+  IdentityStackName:
+    Type: String
+    Default: ${IdentityStackName}
+    Description: Name of the deployed iam/vt-identity-stack.yml stack (its exports supply the PEP task role and the OIDC and carrier roles).
+  NetworkStackName:
+    Type: String
+    Default: ${NetworkStackName}
+    Description: Name of the deployed template-network.yaml stack (its exports supply the VPC, private subnets and security groups).
+  InternalCertificateArn:
+    Type: String
+    Default: ${InternalCertificateArn}
+    Description: ACM certificate for the ALB HTTPS listener.
+  PepContainerImage:
+    Type: String
+    Default: ${PepContainerImage}
+  PepCpuArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues: [ARM64, X86_64]
+    Description: CPU architecture of the PEP image.
+  EntraTenantId:
+    Type: String
+    Default: ${EntraTenantId}
+    AllowedPattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+    ConstraintDescription: Must be a GUID such as 11111111-2222-3333-4444-555555555555.
+    Description: Entra ID tenant ID.
+  EntraClientId:
+    Type: String
+    Default: ${EntraClientId}
+    AllowedPattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+    ConstraintDescription: Must be a GUID such as 11111111-2222-3333-4444-555555555555.
+    Description: Entra ID application (client) ID; the audience of the ID token.
+  SsoApplicationArn:
+    Type: String
+    Default: ${SsoApplicationArn}
+    Description: IAM Identity Center application ARN used for trusted identity propagation (the PEP's SSO_CLIENT_ID).
+  AthenaWorkGroup:
+    Type: String
+    Default: ${AthenaWorkGroup}
+    Description: Must match AthenaWorkGroup in the identity stack.
+  AthenaDatabaseName:
+    Type: String
+    Default: ${AthenaDatabaseName}
+  DeployAgentRuntime:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Create the AgentCore Runtime. It needs the agent image in ECR (scripts/deploy-agent-image.ps1), so set this to
+      false to bring up only the PEP and ALB before the image exists.
+  AgentRepositoryName:
+    Type: String
+    Default: ${AgentRepositoryName}
+    Description: Existing ECR repository holding the agent image.
+  AgentImageTag:
+    Type: String
+    Default: ${AgentImageTag}
+  ModelId:
+    Type: String
+    Default: ${ModelId}
+    Description: Bedrock model or inference profile ID the agent uses (Converse API with tool use).
+  ModelTemperature:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Sampling temperature for the agent's model calls. 0 gives the most repeatable SQL.
+  ModelTopP:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^(0(\.\d+)?|1(\.0+)?)$'
+    Description: Optional nucleus sampling (0-1). Leave empty to omit; recent Claude models reject temperature and topP together.
+  ModelMaxTokens:
+    Type: Number
+    Default: ${ModelMaxTokens}
+    MinValue: 1
+    Description: Maximum output tokens per model call.
+  ServiceDiscoveryDomain:
+    Type: String
+    Default: ${ServiceDiscoveryDomain}
+    Description: Private DNS domain in the VPC; Plane B resolves as plane-b.<domain>.
+  PepDesiredCount:
+    Type: Number
+    Default: ${PepDesiredCount}
+    MinValue: 1
+    Description: >
+      Keep at 1. The PEP keeps sessions in memory: /sessions/init (through the ALB) and the agent's tool calls
+      (through Cloud Map DNS) are routed independently, so with 2 or more tasks a session created on one task is
+      unknown to the others and tool calls fail intermittently with "Invalid or expired session_ref".
+      Raise it only if the PEP is given a shared session store.
+
+Conditions:
+  DeployRuntime: !Equals [!Ref DeployAgentRuntime, "true"]
+
+Resources:
+  # ====================================================================
+  # ECS Fargate: PEP. VPC, subnets and security groups come from the core network stack.
+  # ====================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: claims-copilot-pep
+
+  PepLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/claims-copilot-pep
+      RetentionInDays: 30
+
+  PepExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: ECS task execution role (image pull and logs only)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  PepTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: claims-copilot-pep
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform:
+        CpuArchitecture: !Ref PepCpuArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt PepExecutionRole.Arn
+      # PEP base role from the identity stack; it may only assume the carrier role.
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${IdentityStackName}-pep-service-role-arn"
+      ContainerDefinitions:
+        - Name: pep
+          Image: !Ref PepContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+            - ContainerPort: 8081
+              Protocol: tcp
+          Environment:
+            - {Name: PEP_PLANE_A_PORT, Value: "8080"}
+            - {Name: PEP_PLANE_B_PORT, Value: "8081"}
+            - {Name: PEP_DEFAULT_DATABASE, Value: !Ref AthenaDatabaseName}
+            - {Name: ATHENA_DATABASE, Value: !Ref AthenaDatabaseName}
+            - {Name: ATHENA_WORKGROUP, Value: !Ref AthenaWorkGroup}
+            - {Name: IDP, Value: entra-id}
+            - {Name: OIDC_CLIENT_ID, Value: !Ref EntraClientId}
+            - {Name: OIDC_DISCOVERY_URL, Value: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0/.well-known/openid-configuration"}
+            - {Name: SSO_CLIENT_ID, Value: !Ref SsoApplicationArn}
+            - Name: OIDC_ROLE_ARN
+              Value:
+                Fn::ImportValue: !Sub "${IdentityStackName}-oidc-role-arn"
+            - Name: TIP_ROLE_ARN
+              Value:
+                Fn::ImportValue: !Sub "${IdentityStackName}-enhanced-role-arn"
+            - {Name: AWS_REGION, Value: !Ref "AWS::Region"}
+            # The PEP honours x-pep-agent-role-arn only from a trusted proxy, and only for an allow-listed agent.
+            - {Name: PEP_TRUSTED_PROXY_ROLES, Value: !GetAtt PepProxyRole.Arn}
+            - {Name: PEP_ALLOWED_AGENT_ROLES, Value: !GetAtt AgentRuntimeRole.Arn}
+          # The image ships without curl/wget; probe Plane A with its bundled Python.
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python3.12 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/ping', timeout=4).status==200 else 1)" || exit 1
+            Interval: 15
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PepLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: pep
+
+  # Private DNS for Plane B so the runtime reaches task IPs directly. The ALB never sees 8081.
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref ServiceDiscoveryDomain
+      Vpc:
+        Fn::ImportValue: !Sub "${NetworkStackName}-vpc-id"
+
+  PlaneBDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: plane-b
+      NamespaceId: !GetAtt ServiceDiscoveryNamespace.Id
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - {Type: A, TTL: 10}
+
+  PepService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      Cluster: !Ref EcsCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref PepDesiredCount
+      TaskDefinition: !Ref PepTaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-a-id"
+            - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-b-id"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${NetworkStackName}-pep-task-sg-id"
+      LoadBalancers:
+        - ContainerName: pep
+          ContainerPort: 8080
+          TargetGroupArn: !Ref PlaneATargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt PlaneBDiscoveryService.Arn
+
+  # ====================================================================
+  # Internal ALB: Plane A (8080) only
+  # ====================================================================
+  PlaneATargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-vpc-id"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /ping
+      HealthCheckPort: "8080"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+
+  InternalAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-a-id"
+        - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-b-id"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${NetworkStackName}-alb-sg-id"
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InternalAlb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref InternalCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PlaneATargetGroup
+
+  # ====================================================================
+  # Plane B proxy Lambda, one per agent. AWS authenticates the agent's lambda:InvokeFunction call; this
+  # function then presents ITS OWN role ARN as x-amzn-caller-arn and the agent's role ARN (fixed in
+  # AGENT_ROLE_ARN, never taken from the request) as x-pep-agent-role-arn. To add an agent, deploy another
+  # copy of this function with that agent's role in AGENT_ROLE_ARN and grant only that role invoke rights.
+  # Only this function's security group may reach 8081.
+  # Keep the code in sync with lambda/pep_proxy.py (used by the Terraform build).
+  # ====================================================================
+  PepProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Plane B proxy. Its ARN is the caller identity the PEP sees; add it to the PEP allow-list.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  PepProxyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/claims-copilot-pep-proxy
+      RetentionInDays: 30
+
+  PepProxyFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PepProxyLogGroup
+    Properties:
+      FunctionName: claims-copilot-pep-proxy
+      Description: Forwards agent tool calls to PEP Plane B with a verified x-amzn-caller-arn.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PepProxyRole.Arn
+      Timeout: 130
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-pep-proxy-sg-id"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-a-id"
+          - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-b-id"
+      Environment:
+        Variables:
+          PEP_PLANE_B_URL: !Sub "http://plane-b.${ServiceDiscoveryDomain}:8081"
+          CALLER_ARN: !GetAtt PepProxyRole.Arn
+          AGENT_ROLE_ARN: !GetAtt AgentRuntimeRole.Arn
+          PEP_DEFAULT_DATABASE: !Ref AthenaDatabaseName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          BASE = os.environ["PEP_PLANE_B_URL"].rstrip("/")
+          CALLER = os.environ["CALLER_ARN"]
+          AGENT = os.environ["AGENT_ROLE_ARN"]
+          DB = os.environ["PEP_DEFAULT_DATABASE"]
+          if not re.fullmatch(r"arn:aws[\w-]*:iam::\d{12}:role/[\w+=,.@/-]+", AGENT):
+              raise RuntimeError("AGENT_ROLE_ARN must be a full IAM role ARN")
+          TOOLS = {"list_tables": (), "describe_table": ("table",), "query_lake_formation": ("sql", "max_rows")}
+
+
+          def handler(event, context):
+              tool = event.get("tool")
+              if tool not in TOOLS:
+                  return {"ok": False, "error": f"Unknown tool '{tool}'"}
+              args = event.get("arguments") or {}
+              body = {"session_ref": str(event.get("session_ref", "")), "database": DB}
+              body.update({k: args[k] for k in TOOLS[tool] if k in args})
+              req = urllib.request.Request(
+                  f"{BASE}/mcp/tools/{tool}/call",
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json", "x-amzn-caller-arn": CALLER, "x-pep-agent-role-arn": AGENT},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=120) as resp:
+                      return json.loads(resp.read())
+              except urllib.error.HTTPError as exc:
+                  return {"ok": False, "error": f"Broker returned HTTP {exc.code}.", "retryable": exc.code in (429, 502)}
+              except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                  return {"ok": False, "error": f"Broker unreachable ({type(exc).__name__})."}
+
+  # ====================================================================
+  # Bedrock AgentCore Runtime (agent container, VPC mode)
+  # ====================================================================
+  AgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: AgentCore Runtime execution role. Model invocation, image pull and telemetry only.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: agent-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPull
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AgentRepositoryName}
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:DescribeLogStreams, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
+              - Sid: LogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+              - Sid: Telemetry
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: "*"
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*
+              - Sid: InvokeModel
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/*
+                  - !Sub arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+  # Separate from the role so the proxy function can read the role's ARN (AGENT_ROLE_ARN) without a
+  # circular dependency. This agent's role is the only one granted lambda:InvokeFunction on its proxy.
+  AgentRuntimeInvokePepProxy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: invoke-pep-proxy
+      Roles:
+        - !Ref AgentRuntimeRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokePepProxy
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt PepProxyFunction.Arn
+
+  ClaimsCopilotAgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: DeployRuntime
+    DependsOn: AgentRuntimeInvokePepProxy
+    Properties:
+      AgentRuntimeName: claims_copilot_agent
+      Description: Claims copilot agent. Discovers the schema and queries data through PEP Plane B MCP tools.
+      RoleArn: !GetAtt AgentRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentRepositoryName}:${AgentImageTag}"
+      # The runtime's network interfaces live in the core stack's subnets and security group, so they
+      # outlive this stack and never block its deletion or rollback.
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${NetworkStackName}-agent-runtime-sg-id"
+          Subnets:
+            - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-a-id"
+            - Fn::ImportValue: !Sub "${NetworkStackName}-private-subnet-b-id"
+      ProtocolConfiguration: HTTP
+      # Inbound auth is the caller's Entra ID JWT, validated at the edge (issuer, signature, expiry, audience).
+      # No RequestHeaderConfiguration on purpose: the Authorization header is never passed to the agent code.
+      # The audience is the app's client ID, the same one the PEP validates (MVP trade-off, see README).
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://login.microsoftonline.com/${EntraTenantId}/v2.0/.well-known/openid-configuration"
+          AllowedAudience:
+            - !Ref EntraClientId
+      EnvironmentVariables:
+        # The agent has no route to Plane B; it can only invoke this function.
+        PEP_PROXY_FUNCTION: !Ref PepProxyFunction
+        PEP_DEFAULT_DATABASE: !Ref AthenaDatabaseName
+        MODEL_ID: !Ref ModelId
+        MODEL_TEMPERATURE: !Ref ModelTemperature
+        MODEL_TOP_P: !Ref ModelTopP
+        MODEL_MAX_TOKENS: !Ref ModelMaxTokens
+
+Outputs:
+  PlaneAUrl:
+    Description: Set as PEP_PLANE_A_URL in .env (internal ALB, HTTPS, Plane A only).
+    Value: !Sub "https://${InternalAlb.DNSName}"
+  AgentImageUri:
+    Description: Agent image the runtime pulls (push it with scripts/deploy-agent-image.ps1).
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentRepositoryName}:${AgentImageTag}"
+  AgentRuntimeArn:
+    Condition: DeployRuntime
+    Description: Set as BEDROCK_AGENT_ID in .env.
+    Value: !GetAtt ClaimsCopilotAgentRuntime.AgentRuntimeArn
+  AgentRuntimeId:
+    Condition: DeployRuntime
+    Value: !GetAtt ClaimsCopilotAgentRuntime.AgentRuntimeId
+  AgentCallerArn:
+    Description: Proxy role the PEP sees on Plane B (x-amzn-caller-arn). Already set as PEP_TRUSTED_PROXY_ROLES on the PEP task.
+    Value: !GetAtt PepProxyRole.Arn
+  AgentRoleArn:
+    Description: Agent role the proxy forwards in x-pep-agent-role-arn. Already set as PEP_ALLOWED_AGENT_ROLES on the PEP task.
+    Value: !GetAtt AgentRuntimeRole.Arn
+  PepProxyFunctionName:
+    Description: Plane B proxy Lambda; the only invoker is the agent runtime role.
+    Value: !Ref PepProxyFunction
+  PlaneBInternalUrl:
+    Description: VPC-internal Plane B endpoint used by the proxy Lambda only. Never expose it.
+    Value: !Sub "http://plane-b.${ServiceDiscoveryDomain}:8081"

@@ -1,0 +1,248 @@
+﻿# Copyright 2026 Angel Krustev / VerticalTurn Inc.
+# SPDX-License-Identifier: Apache-2.0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Secure Insurance Claims Copilot - core network stack. Long-lived and shared: private subnets, NAT gateway,
+  route table, S3 gateway endpoint and the three security groups. The app stack (template.yaml) imports these.
+  AgentCore Runtime keeps network interfaces in the subnets and security groups below for hours after a runtime
+  is deleted, so they live here, apart from the app stack that can fail, roll back or be deleted at any time.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: ${VpcId}
+  NatSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: ${NatSubnetId}
+    Description: Existing PUBLIC subnet (route to the internet gateway) that hosts the NAT gateway.
+  PrivateSubnetCidrs:
+    Type: CommaDelimitedList
+    Default: ${PrivateSubnetCidrs}
+    Description: Two unused CIDR blocks inside the VPC for the private subnets (PEP, ALB and AgentCore Runtime).
+  PrivateSubnetAzIds:
+    Type: CommaDelimitedList
+    Default: ${PrivateSubnetAzIds}
+    Description: >
+      AZ IDs (not names) for the two private subnets, in the same order as the CIDRs. In us-east-1 AgentCore Runtime
+      supports only use1-az1, use1-az2 and use1-az4.
+  VpnOrStreamlitCidr:
+    Type: String
+    Default: ${VpnOrStreamlitCidr}
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR allowed to reach the internal ALB (Plane A). Only matches clients whose own address reaches the ALB (no address translation).
+  VpnSecurityGroupId:
+    Type: String
+    Default: ${VpnSecurityGroupId}
+    AllowedPattern: ^$|^sg-[0-9a-f]{8,17}$
+    ConstraintDescription: Empty, or a security group ID such as sg-0123456789abcdef0.
+    Description: >
+      Optional. Security group of a VPN gateway that translates client addresses (SNAT/masquerade), so the ALB
+      sees the gateway's VPC address instead of the client's. The ALB then accepts HTTPS from this group.
+  CreateS3GatewayEndpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the free S3 gateway endpoint on the private route table (keeps ECR layer downloads off the NAT).
+
+Conditions:
+  CreateS3GatewayEndpoint: !Equals [!Ref CreateS3GatewayEndpoint, "true"]
+  HasVpnSecurityGroup: !Not [!Equals [!Ref VpnSecurityGroupId, ""]]
+
+Resources:
+  # ====================================================================
+  # Private subnets + NAT gateway. Fargate tasks and AgentCore Runtime ENIs have no public IP,
+  # so all their outbound traffic (ECR, STS, Athena, Bedrock, the IdP) goes through the NAT.
+  # ====================================================================
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZoneId: !Select [0, !Ref PrivateSubnetAzIds]
+      CidrBlock: !Select [0, !Ref PrivateSubnetCidrs]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: claims-copilot-private-a}
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      AvailabilityZoneId: !Select [1, !Ref PrivateSubnetAzIds]
+      CidrBlock: !Select [1, !Ref PrivateSubnetCidrs]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - {Key: Name, Value: claims-copilot-private-b}
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Renamed from NatGateway after the original gateway was deleted by hand outside CloudFormation.
+  NatGatewayV2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref NatSubnetId
+      AllocationId: !GetAtt NatEip.AllocationId
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - {Key: Name, Value: claims-copilot-private}
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayV2
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Free. Keeps ECR image-layer downloads from S3 off the NAT (no data processing charge).
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateS3GatewayEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # ====================================================================
+  # Security groups. Plane B (8081) is reachable ONLY from the Plane B proxy Lambda's SG.
+  # ====================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB for PEP Plane A
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpnOrStreamlitCidr
+          Description: TLS from VPN / Streamlit
+        - !If
+          - HasVpnSecurityGroup
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            SourceSecurityGroupId: !Ref VpnSecurityGroupId
+            Description: TLS from the VPN gateway (translated client addresses)
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !Ref PepTaskSecurityGroup
+          Description: Plane A to PEP tasks
+      Tags:
+        - {Key: Name, Value: claims-copilot-alb}
+
+  PepTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PEP Fargate tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs and IdP over HTTPS
+      Tags:
+        - {Key: Name, Value: claims-copilot-pep-task}
+
+  PepProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Plane B proxy Lambda network interfaces
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          DestinationSecurityGroupId: !Ref PepTaskSecurityGroup
+          Description: Plane B tool calls
+      Tags:
+        - {Key: Name, Value: claims-copilot-pep-proxy}
+
+  AgentRuntimeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgentCore Runtime network interfaces
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Bedrock model invocation and Lambda API
+      Tags:
+        - {Key: Name, Value: claims-copilot-agent-runtime}
+
+  PlaneAIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PepTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: Plane A from the ALB only
+
+  PlaneBIngressFromProxy:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PepTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      SourceSecurityGroupId: !Ref PepProxySecurityGroup
+      Description: Plane B from the proxy Lambda only
+
+Outputs:
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub "${AWS::StackName}-vpc-id"
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${AWS::StackName}-private-subnet-a-id"
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${AWS::StackName}-private-subnet-b-id"
+  AlbSecurityGroupId:
+    Value: !GetAtt AlbSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-alb-sg-id"
+  PepTaskSecurityGroupId:
+    Value: !GetAtt PepTaskSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-pep-task-sg-id"
+  AgentRuntimeSecurityGroupId:
+    Value: !GetAtt AgentRuntimeSecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-agent-runtime-sg-id"
+  PepProxySecurityGroupId:
+    Value: !GetAtt PepProxySecurityGroup.GroupId
+    Export:
+      Name: !Sub "${AWS::StackName}-pep-proxy-sg-id"
+  NatPublicIp:
+    Description: Egress IP of the PEP and agent runtime (allow-list it at the IdP or elsewhere if needed).
+    Value: !Ref NatEip

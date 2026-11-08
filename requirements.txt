@@ -1,0 +1,5 @@
+streamlit>=1.36
+#boto3>=1.40
+msal>=1.28
+python-dotenv>=1.0
+requests>=2.31
