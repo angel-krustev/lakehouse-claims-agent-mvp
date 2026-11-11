@@ -2,6 +2,8 @@
 
 A functional, local-VPC Bedrock Agent demonstrating how to securely query enterprise data lakes using the [AgentCore TIP MCP Broker](https://github.com/angel-krustev/agentcore-tip-mcp).
 
+**AgentCore TIP Broker repository:** [agentcore-tip-mcp](https://github.com/angel-krustev/agentcore-tip-mcp) contains the broker implementation, architecture, and identity setup guidance used by this showcase.
+
 > ⚠️ **Architecture Notice: MVP vs. Production**
 > This repository provides an MVP implementation using AWS Cloud Map and raw Fargate for local VPC testing. It does **not** include the private API Gateway and IAM Auth required for production-grade Machine-to-Machine (M2M) Zero-Trust. 
 >
