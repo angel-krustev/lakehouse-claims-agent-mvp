@@ -15,55 +15,23 @@ This MVP implements a **Secure Insurance Claims Copilot** — a Streamlit-powere
 
 ### Architecture Flow
 
-```
-┌─────────────┐     PKCE Login      ┌──────────────────┐
-│   User      │ ──────────────────► │   Entra ID (MSAL) │
-│  (Browser)  │  ◄───────────────── │   (JWT Issued)    │
-└──────┬──────┘                     └──────────────────┘
-       │ JWT
-       │ HTTP POST /sessions/init
-       ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     Streamlit App (app.py)                              │
-│                                                                         │
-│  1. Authenticates user via Entra ID (MSAL PublicClient, PKCE)          │
-│  2. Sends JWT to PEP Plane A → receives opaque session_ref             │
-│  3. Sends user prompt + session_ref to Bedrock Agent via invoke_agent   │
-│  4. Renders agent responses (tables, summaries)                         │
-│                                                                         │
-│  🔒 Never touches Plane B — never sees Lake Formation data directly      │
-└────────────────────────────┬────────────────────────────────────────────┘
-                             │ prompt + session_ref
-                             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                AWS Bedrock Agent (AgentCore Runtime)                     │
-│                                                                         │
-│  1. Receives prompt, generates Athena SQL using table schemas in prompt  │
-│  2. Invokes tool: query_lake_formation(session_ref, sql)                 │
-│  3. Tool call → Lambda proxy (pep_proxy.py) → PEP Plane B (port 8081)   │
-│                                                                         │
-│  🔒 Agent is "token blind" — sees only opaque session_ref, not the JWT   │
-└────────────────────────────┬────────────────────────────────────────────┘
-                             │ MCP tool calls (session_ref + SQL)
-                             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│              Zero-Trust Broker PEP (Fargate, plane-a:8080, plane-b:8081)│
-│                                                                         │
-│  Plane A (8080): /sessions/init — binds user identity to session_ref    │
-│  Plane B (8081): MCP tool endpoint — executes Athena queries via        │
-│                  Lake Formation with row/column-level security           │
-│                                                                         │
-│  🔒 Identity propagation to Lake Formation handled entirely by the PEP   │
-└────────────────────────────┬────────────────────────────────────────────┘
-                             │ Athena queries (with LF security)
-                             ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│            AWS Lake Formation + Athena (insurance_analytics DB)          │
-│                                                                         │
-│  Tables: insurance_claims_enriched, claim_payments                       │
-│  Security: row-level + column-level enforcement per user identity        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+![AgentCore TIP MCP architecture flow](AgentCore-TIP-MCP.png)
+
+1. **MFA login:** The user signs in to Entra ID with PKCE and receives an identity-provider JWT.
+2. **Initialize the session:** The app posts the JWT to `/sessions/init` through the VPN .
+3. **Assume the web identity:** The broker uses the identity-provider token with AWS STS `AssumeRoleWithWebIdentity` to establish the user's AWS identity.
+4. **Create the TIP token:** The broker calls `CreateTokenWithIAM` to obtain the Trusted Identity Propagation (TIP) token.
+5. **Encrypt and vault the session context:** The broker encrypts and stores the identity-center context and user ID in the session vault.
+6. **Return the opaque session reference:** The broker returns `session_ref` to the user environment; the JWT is not passed to the agent.
+7. **Send the prompt to the agent:** The user environment passes `session_ref` and the prompt to the Bedrock AgentCore agent.
+
+   **7a. Authenticate inbound to AgentCore:** AgentCore performs inbound OIDC authentication for the agent request. **Recommendation:** use a different audience for AgentCore than for PEP session initialization, even when both are for the same app.
+8. **Call the MCP endpoint:** The agent sends a SigV4-signed MCP request. The broker verifies the signature and routes it to Plane B on port 8081.
+9. **Load and bind the session:** Plane B loads and decrypts the session data from the encrypted Redis vault, then performs the TOFU bind.
+10. **Assume the scoped role:** The broker assumes an AWS role using the identity-center context and inline policy.
+11. **Execute the query:** The broker queries Athena/Glue using short-lived credentials. Lake Formation enforces the user's row-level security and filters.
+12. **Return authorized rows:** Only filtered rows, without keys or tokens, are returned from the data layer.
+13. **Return results to the user:** The results are returned to the user environment.
 
 ### Key Security Properties
 
@@ -71,7 +39,7 @@ This MVP implements a **Secure Insurance Claims Copilot** — a Streamlit-powere
 |----------|-------------------|
 | **Zero-Trust Authentication** | Entra ID via MSAL PKCE — no client secrets stored |
 | **Token Blindness** | Bedrock Agent never sees the user's JWT; only an opaque `session_ref` |
-| **Air-Gapped Plane B** | Plane B (port 8081) is never exposed to the ALB or internet; only the Lambda proxy reaches it |
+| **Air-Gapped Plane B** | Plane B (port 8081) is never exposed to the ALB or internet; only the API GW or/and the Lambda proxy reaches it |
 | **Row/Column Security** | Enforced natively by AWS Lake Formation — no Python-side filtering |
 | **Identity Propagation** | AWS Trusted Identity Propagation (TIP) handled by the PEP — no STS `AssumeRole` in app code |
 
