@@ -1,6 +1,6 @@
 # Lakehouse Claims Agent (MVP Reference Implementation)
 
-A functional, local-VPC Bedrock Agent demonstrating how to securely query enterprise data lakes using the [AgentCore TIP MCP Broker](https://github.com/your-username/agentcore-tip-mcp).
+A functional, local-VPC Bedrock Agent demonstrating how to securely query enterprise data lakes using the [AgentCore TIP MCP Broker](https://github.com/angel-krustev/agentcore-tip-mcp).
 
 > ⚠️ **Architecture Notice: MVP vs. Production**
 > This repository provides an MVP implementation using AWS Cloud Map and raw Fargate for local VPC testing. It does **not** include the private API Gateway and IAM Auth required for production-grade Machine-to-Machine (M2M) Zero-Trust. 
