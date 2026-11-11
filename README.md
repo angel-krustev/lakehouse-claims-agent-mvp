@@ -15,6 +15,12 @@ A functional, local-VPC Bedrock Agent demonstrating how to securely query enterp
 
 This MVP implements a **Secure Insurance Claims Copilot** — a Streamlit-powered conversational AI that lets users query insurance claims data in an AWS data lake through natural language, with row- and column-level security enforced natively by **AWS Lake Formation**.
 
+**Integration gap (November 2026):** AWS does not provide a native Amazon Bedrock AgentCore-to-IAM Identity Center integration for end-to-end Trusted Identity Propagation to Lake Formation. This solution fills that gap. If AWS introduces native integration in the future, the underlying data-permission model can remain unchanged: it is independent of the agentic flow, with user- and group-level data authorization enforced by Lake Formation, subject to the broker's IAM and session-policy limits.
+
+### Demo
+
+[![Watch the demo on YouTube](https://img.youtube.com/vi/E_QWplNfCiM/hqdefault.jpg)](https://youtu.be/E_QWplNfCiM?si=jtTbKN3pStwUwqP8)
+
 ### Architecture Flow
 
 ![AgentCore TIP MCP architecture flow](AgentCore-TIP-MCP.png)
